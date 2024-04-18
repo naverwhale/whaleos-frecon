@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 The Chromium OS Authors. All rights reserved.
+ * Copyright 2014 The ChromiumOS Authors
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -26,6 +26,11 @@
 #include "term.h"
 #include "util.h"
 
+#define  DBUS_WAIT_DELAY_US  50000
+
+/* Splash screen */
+splash_t* splash;
+
 #define  FLAG_CLEAR                        'c'
 #define  FLAG_DAEMON                       'd'
 #define  FLAG_ENABLE_OSC                   'G'
@@ -46,7 +51,7 @@
 #define  FLAG_PRINT_RESOLUTION             'p'
 #define  FLAG_SCALE                        'S'
 #define  FLAG_SPLASH_ONLY                  's'
-#define  FLAG_WAIT_CHILD                   'w'
+#define  FLAG_WAIT_DROP_MASTER             'W'
 
 static const struct option command_options[] = {
 	{ "clear", required_argument, NULL, FLAG_CLEAR },
@@ -71,6 +76,7 @@ static const struct option command_options[] = {
 	{ "pre-create-vts", no_argument, NULL, FLAG_PRE_CREATE_VTS },
 	{ "scale", required_argument, NULL, FLAG_SCALE },
 	{ "splash-only", no_argument, NULL, FLAG_SPLASH_ONLY },
+	{ "wait-drop-master", no_argument, NULL, FLAG_WAIT_DROP_MASTER },
 	{ NULL, 0, NULL, 0 }
 };
 static const char * const command_help[] = {
@@ -96,6 +102,7 @@ static const char * const command_help[] = {
 	"Create all VTs immediately instead of on-demand.",
 	"Default scale for splash screen images.",
 	"Exit immediately after finishing splash animation.",
+	"Wait to drop DRM master until the escape code is received.",
 };
 
 static void usage(int status)
@@ -143,6 +150,21 @@ static void parse_offset(char* param, int32_t* x, int32_t* y)
 	token = strtok_r(NULL, ",", &saveptr);
 	if (token)
 		*y = strtol(token, NULL, 0);
+}
+
+static void main_on_login_prompt_visible(void)
+{
+	if (command_flags.daemon && !command_flags.enable_vts) {
+		LOG(INFO, "Chrome started, our work is done, exiting.");
+		exit(EXIT_SUCCESS);
+	} else {
+		if (splash) {
+			splash_destroy(splash);
+			splash = NULL;
+		}
+		if (command_flags.enable_vt1)
+			LOG(WARNING, "VT1 enabled and Chrome is active!");
+	}
 }
 
 int main_process_events(uint32_t usec)
@@ -218,12 +240,49 @@ int main_process_events(uint32_t usec)
 	return 0;
 }
 
+uint32_t get_process_events_timeout()
+{
+	uint32_t usec = 0;
+
+	if (!dbus_is_initialized()) {
+		/*
+		 * The DBUS service launches later than the boot-splash service, and
+		 * as a result, when splash_run starts DBUS is not yet up. Keep
+		 * trying to initialize it while we're waiting.
+		 */
+		if (dbus_init()) {
+			LOG(INFO, "DBUS initialized.");
+			/*
+			 * Ask DBUS to call us back so we can quit when login prompt is
+			 * visible.
+			 */
+			dbus_set_login_prompt_visible_callback(
+				main_on_login_prompt_visible);
+			/*
+			 * Ask DBUS to notify us when suspend has finished so monitors
+			 * can be reprobed in case they changed during suspend.
+			 */
+			dbus_set_suspend_done_callback(term_suspend_done, NULL);
+		} else {
+			/*
+			 * Wait a bit for DBus to come up, so we don't flood the system
+			 * with requests.
+			 */
+			usec = DBUS_WAIT_DELAY_US;
+		}
+	}
+
+	return usec;
+}
+
 int main_loop(void)
 {
 	int status;
 
 	while (1) {
-		status = main_process_events(0);
+		uint32_t usec = get_process_events_timeout();
+
+		status = main_process_events(usec);
 		if (status != 0) {
 			LOG(ERROR, "Input process returned %d.", status);
 			break;
@@ -257,17 +316,6 @@ bool set_drm_master_relax(void)
 	return true;
 }
 
-static void main_on_login_prompt_visible(void)
-{
-	if (command_flags.daemon && !command_flags.enable_vts) {
-		LOG(INFO, "Chrome started, our work is done, exiting.");
-		exit(EXIT_SUCCESS);
-	} else {
-		if (command_flags.enable_vt1)
-			LOG(WARNING, "VT1 enabled and Chrome is active!");
-	}
-}
-
 static void legacy_print_resolution(int argc, char* argv[])
 {
 	int c;
@@ -298,7 +346,6 @@ int main(int argc, char* argv[])
 	int pts_fd;
 	unsigned vt;
 	int32_t x, y;
-	splash_t* splash;
 	drm_t* drm;
 
 	legacy_print_resolution(argc, argv);
@@ -347,6 +394,10 @@ int main(int argc, char* argv[])
 				command_flags.splash_only = true;
 				break;
 
+			case FLAG_WAIT_DROP_MASTER:
+				command_flags.wait_drop_master = true;
+				break;
+
 			case FLAG_HELP:
 				usage(0);
 				break;
@@ -365,12 +416,17 @@ int main(int argc, char* argv[])
 	}
 	/* And PID file. */
 	unlink(FRECON_PID_FILE);
+	/* And hi-res file. */
+	unlink(FRECON_HI_RES_FILE);
+
+	/* And current terminal. */
+	unlink(FRECON_CURRENT_VT);
 
 	if (command_flags.daemon) {
 		int status;
 
 		daemonize(command_flags.pre_create_vts);
-		status = mkdir(FRECON_RUN_DIR, S_IRWXU);
+		status = mkdir(FRECON_RUN_DIR, S_IRWXU | S_IRWXG);
 		if (status == 0 || (status < 0 && errno == EEXIST)) {
 			char pids[32];
 
@@ -397,6 +453,16 @@ int main(int argc, char* argv[])
 	if (splash == NULL) {
 		LOG(ERROR, "Splash init failed.");
 		return EXIT_FAILURE;
+	} else {
+		int status;
+
+		status = mkdir(FRECON_RUN_DIR, S_IRWXU | S_IRWXG);
+		if (status == 0 || (status < 0 && errno == EEXIST)) {
+			char hires[32];
+
+			sprintf(hires, "%u", splash_is_hires(splash));
+			write_string_to_file(FRECON_HI_RES_FILE, hires);
+		}
 	}
 
 	if (command_flags.pre_create_vts) {
@@ -480,34 +546,20 @@ int main(int argc, char* argv[])
 		}
 	}
 
-	splash_destroy(splash);
+	if (!command_flags.daemon) {
+		splash_destroy(splash);
+		splash = NULL;
+	}
 
 	if (command_flags.splash_only)
 		goto main_done;
-
-	/*
-	 * The DBUS service launches later than the boot-splash service, and
-	 * as a result, when splash_run starts DBUS is not yet up, but, by
-	 * the time splash_run completes, it is running.
-	 * We really need DBUS now, so we can interact with Chrome.
-	 */
-	dbus_init_wait();
-	/*
-	 * Ask DBUS to call us back so we can quit when login prompt is visible.
-	 */
-	dbus_set_login_prompt_visible_callback(main_on_login_prompt_visible);
-	/*
-	 * Ask DBUS to notify us when suspend has finished so monitors can be reprobed
-	 * in case they changed during suspend.
-	 */
-	dbus_set_suspend_done_callback(term_suspend_done, NULL);
 
 	if (command_flags.daemon) {
 		if (command_flags.enable_vts)
 			set_drm_master_relax();
 		if (command_flags.enable_vt1)
 			term_switch_to(TERM_SPLASH_TERMINAL);
-		else
+		else if (!command_flags.wait_drop_master)
 			term_background(true);
 	} else {
 		/* Create and switch to first term in interactve mode. */
@@ -524,6 +576,8 @@ main_done:
 	drm_close();
 	if (command_flags.daemon)
 		unlink(FRECON_PID_FILE);
+	unlink(FRECON_HI_RES_FILE);
+        unlink(FRECON_CURRENT_VT);
 
 	return ret;
 }

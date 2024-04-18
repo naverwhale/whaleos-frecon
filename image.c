@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 The Chromium OS Authors. All rights reserved.
+ * Copyright 2015 The ChromiumOS Authors
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -128,6 +128,17 @@ int image_load_image_from_file(image_t* image)
 
 	png_set_filler(png, 0xff, PNG_FILLER_AFTER);
 
+	// WhaleOS tries white background if images don't have one.
+	{
+		png_color_16 *image_bg;
+		png_color_16 bg = { 0xff, 0xff, 0xff, 0xff, 0xff };
+
+		if (png_get_bKGD(png, info, &image_bg))
+			png_set_background(png, image_bg, PNG_BACKGROUND_GAMMA_FILE, 1, 1.0);
+		else
+			png_set_background(png, &bg, PNG_BACKGROUND_GAMMA_SCREEN, 0, 1.0);
+	}
+
 	png_set_read_user_transform_fn(png, image_rgb);
 	png_read_update_info(png, info);
 
@@ -183,8 +194,8 @@ int image_show(image_t* image, fb_t* fb)
 		startx = image->location_x;
 		starty = image->location_y;
 	} else {
-		startx = (fb_getwidth(fb) - w)/2;
-		starty = (fb_getheight(fb) - h)/2;
+		startx = (fb_getwidth(fb) - (int32_t)w)/2;
+		starty = (fb_getheight(fb) - (int32_t)h)/2;
 	}
 
 	if (image->use_offset) {

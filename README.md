@@ -1,3 +1,5 @@
+This repo for WhaleOS is based on https://chromium.googlesource.com/chromiumos/platform/frecon/.
+
 # frecon: the Freon Console
 
 This is a terminal emulator that replaces the kernel Virtual Terminal (VT)
@@ -83,6 +85,9 @@ is above 1920. This allows frecon to make runtime decision which set of images
 to use instead running frecon first with `--print-resolution` option and making
 this decision in a script that invokes frecon.
 Free form image file name in the command line are added unconditionally.
+* `--wait-drop-master`
+    Wait to call drmDropMaster until prompted by the caller with the escape
+code: `drmdropmaster:`.
 
 ## Imaging escape codes
 
@@ -117,7 +122,7 @@ printf "\033]box:color=0xFFFFFFFF;size=100,100\a" > /dev/pts/1
 
 An escape code can be used to enable/disable keyboard input processing on
 a terminal. The setting is stored per terminal and applies to input "within"
-terminal. Swithing between terminals, scrolling, backlight control etc remains
+terminal. Switching between terminals, scrolling, backlight control etc remains
 operational.
 
 `input:onoff`
@@ -130,6 +135,17 @@ printf "\033]input:on\a" > /run/frecon/vt0
 printf "\033]input:off\a" > /run/frecon/vt1
 ```
 
+## SwitchVT escape code
+
+An escape code that can be used to switch currently active terminal.
+`switchvt:termnum`
+
+* where termnum is an integer from 0 to num-vts-1
+
+Example:
+```sh
+printf "\033]switchvt:1\a" > /run/frecon/current
+```
 
 ## Files
 
@@ -141,3 +157,28 @@ Frecon creates the following files and links in `/run/frecon` directory:
 - for every VT it creates, a link from `/run/frecon/vt%u` to `/dev/pts/X`
   where `%u` is terminal number from 0 to num-vts - 1 so the user can determine
   which VT uses which pts since pts number assignment is not deterministic.
+
+- /run/frecon/current is a symlink to currently active terminal
+  (/run/frecon/vtX). It can be used to discover which terminal is currently
+  active or to write text to currently active terminal.
+
+
+## Example Usage
+
+For the sake of an example let's assume you wish to switch between vt1 -> vt0(normal screen) -> vt1
+we can do so using the following steps:
+
+1. start off by linking /run/frecon/current to /run/frecon/vt1
+2. use exit code to actually switch to vt1 i.e. 'printf "\\033]switchvt:1\\a" > /run/frecon/current'
+3. switch to vt0 now by using the following command  'printf "\\033]switchvt:0\\a" > /run/frecon/current'
+4. repeat steps 1 and 2 since switching to vt0 breaks the link
+
+## DRM Drop Master
+
+An escape code can be used to tell frecon to drop DRM master. This is useful
+when `frecon` is invoked with `--wait-drop-master`.
+
+Example:
+```sh
+printf "\033]drmdropmaster\a" > /run/frecon/current
+```

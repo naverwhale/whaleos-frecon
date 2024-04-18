@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+ * Copyright 2014 The ChromiumOS Authors
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -320,6 +320,21 @@ static void term_esc_input(terminal_t* terminal, char* params)
 		LOG(ERROR, "Invalid parameter for input escape.\n");
 }
 
+static void term_esc_switchvt(terminal_t* terminal, char* params)
+{
+	uint32_t vt = (uint32_t)strtoul(params, NULL, 0);
+	if (vt >= term_num_terminals || vt >= TERM_MAX_TERMINALS) {
+		LOG(ERROR, "Invalid parameter for switchvt escape.");
+		return;
+	}
+	term_switch_to(vt);
+}
+
+static void term_esc_drmdropmaster(terminal_t* terminal, char* params)
+{
+	term_background(true);
+}
+
 /*
  * Assume all one or two digit sequences followed by ; are xterm OSC escapes.
  */
@@ -361,6 +376,10 @@ static void term_osc_cb(struct tsm_vte *vte, const uint32_t *osc_string,
 		term_esc_draw_box(terminal, osc + 4);
 	else if (strncmp(osc, "input:", 6) == 0)
 		term_esc_input(terminal, osc + 6);
+	else if (strncmp(osc, "switchvt:", 9) == 0)
+		term_esc_switchvt(terminal, osc + 9);
+	else if (strncmp(osc, "drmdropmaster", 13) == 0)
+		term_esc_drmdropmaster(terminal, osc + 13);
 	else if (is_xterm_osc(osc))
 		; /* Ignore it. */
 	else
@@ -472,6 +491,17 @@ static void term_clear_border(terminal_t* terminal)
 	fb_unlock(terminal->fb);
 }
 
+static void term_hide_cursor(terminal_t* terminal)
+{
+	tsm_screen_set_flags(terminal->term->screen, TSM_SCREEN_HIDE_CURSOR);
+}
+
+__attribute__ ((unused))
+static void term_show_cursor(terminal_t* terminal)
+{
+	term_write_message(terminal, "\033[?25h");
+}
+
 terminal_t* term_init(unsigned vt, int pts_fd)
 {
 	const int scrollback_size = 200;
@@ -576,6 +606,11 @@ terminal_t* term_init(unsigned vt, int pts_fd)
 		return NULL;
 	}
 
+	if (!interactive) {
+		term_hide_cursor(new_terminal);
+		term_input_enable(new_terminal, false);
+	}
+
 	return new_terminal;
 }
 
@@ -603,6 +638,8 @@ void term_close(terminal_t* term)
 
 	snprintf(path, sizeof(path), FRECON_VT_PATH, term->vt);
 	unlink(path);
+	if (term->vt == term_get_current())
+		unlink(FRECON_CURRENT_VT);
 
 	if (term->fb) {
 		fb_close(term->fb);
@@ -741,17 +778,6 @@ void term_write_message(terminal_t* terminal, char* message)
 	}
 }
 
-static void term_hide_cursor(terminal_t* terminal)
-{
-	term_write_message(terminal, "\033[?25l");
-}
-
-__attribute__ ((unused))
-static void term_show_cursor(terminal_t* terminal)
-{
-	term_write_message(terminal, "\033[?25h");
-}
-
 fb_t* term_getfb(terminal_t* terminal)
 {
 	return terminal->fb;
@@ -770,15 +796,12 @@ void term_set_terminal(int num, terminal_t* terminal)
 int term_create_splash_term(int pts_fd)
 {
 	terminal_t* terminal = term_init(TERM_SPLASH_TERMINAL, pts_fd);
-	
 	if (!terminal) {
 		LOG(ERROR, "Could not create splash term.");
 		return -1;
 	}
 	term_set_terminal(TERM_SPLASH_TERMINAL, terminal);
 
-	// Hide the cursor on the splash screen
-	term_hide_cursor(terminal);
 	return 0;
 }
 
@@ -793,6 +816,18 @@ void term_destroy_splash_term(void)
 	term_close(terminal);
 }
 
+void term_update_current_link(void)
+{
+	char path[32];
+	unlink(FRECON_CURRENT_VT);
+	if (TERM_SPLASH_TERMINAL != current_terminal ||
+	    command_flags.enable_vt1) {
+		snprintf(path, sizeof(path), FRECON_VT_PATH, current_terminal);
+		if (symlink(path, FRECON_CURRENT_VT) < 0)
+			LOG(ERROR, "set_current: failed to create current symlink.");
+	}
+}
+
 void term_set_current(uint32_t t)
 {
 	if (t >= TERM_MAX_TERMINALS)
@@ -800,8 +835,10 @@ void term_set_current(uint32_t t)
 	else
 	if (t >= term_num_terminals)
 		LOG(ERROR, "set_current: larger than num terminals");
-	else
+	else {
 		current_terminal = t;
+		term_update_current_link();
+	}
 }
 
 uint32_t term_get_current(void)
@@ -857,12 +894,14 @@ int term_switch_to(unsigned int vt)
 	if (term_is_active(terminal))
 		term_deactivate(terminal);
 
+	/* Always background the splash terminal, so Chrome can become DRM
+	 * master. */
 	if (vt == TERM_SPLASH_TERMINAL
-	    && !term_get_terminal(TERM_SPLASH_TERMINAL)
 	    && !command_flags.enable_vt1) {
 		term_set_current(vt);
-		/* Splash term is already gone, returning to Chrome. */
-		term_background(false);
+                /* Returning to Chrome. Splash screen animation may be still
+                 * running in background. */
+		term_background(true);
 		return vt;
 	}
 
@@ -970,11 +1009,25 @@ void term_zoom(bool zoom_in)
  */
 void term_background(bool onetry)
 {
+        terminal_t* terminal = term_get_current_terminal();
 	int retry = onetry ? 1 : 5;
 	if (in_background)
 		return;
 	in_background = true;
+
+        /* The terminal also needs to be deactivated so it doesn't consume key
+         * presses. */
+	if (term_is_active(terminal))
+		term_deactivate(terminal);
+
 	drm_dropmaster(NULL);
+
+	if (!dbus_is_initialized()) {
+		LOG(WARNING, "Unable to send display ownership DBus message to "
+                	"Chrome DisplayService: DBus not initialized");
+		return;
+	}
+
 	while (!dbus_take_display_ownership() && retry--) {
 		if (onetry)
 			break;

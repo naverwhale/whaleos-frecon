@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 The Chromium OS Authors. All rights reserved.
+ * Copyright 2015 The ChromiumOS Authors
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -13,8 +13,8 @@
 
 #include "fb.h"
 
-#define HIRES_THRESHOLD_HR 1920
-#define HIRES_THRESHOLD_VR 1920
+#define HIRES_THRESHOLD_HR 2048
+#define HIRES_THRESHOLD_VR 2048
 #define MAX_SCALE_FACTOR 100
 
 typedef struct _image_t image_t;
